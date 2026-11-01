@@ -1,4 +1,4 @@
-import { createClient } from '@libsql/client/web';
+import { createClient } from '@libsql/client/http';
 
 export default {
   async fetch(request, env) {
