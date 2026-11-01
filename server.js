@@ -129,7 +129,7 @@ export default {
 
       if (url.pathname === "/api/arcade/online" && request.method === "GET") {
         const result = await db.execute(
-          "SELECT COUNT(DISTINCT token) as online FROM sessions WHERE last_seen > datetime('now', '-5 minutes')"
+          "SELECT COUNT(DISTINCT token) as online FROM sessions WHERE last_seen > datetime('now', '-1 minutes')"
         );
         return Response.json({ online: Number(result.rows[0].online) }, { headers: corsHeaders });
       }
