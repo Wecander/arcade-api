@@ -104,6 +104,10 @@ function createTursoClient(tursoUrl, authToken) {
   return { execute: execute };
 }
 
+// ─── Constants ──────────────────────────────────────────────
+const VALID_CATS = ["typing", "clicking", "reaction", "memory"];
+const VALID_DIFFS = ["easy", "medium", "hard", "expert"];
+
 export default {
   async fetch(request, env) {
     const corsHeaders = {
@@ -127,86 +131,83 @@ export default {
     try {
       const db = createTursoClient(env.TURSO_URL, env.TURSO_TOKEN);
 
-      // 1. Онлайн и общее количество результатов
+      // ─── /api/arcade/online ───────────────────────────────
+      // GET — сколько уникальных токенов были активны за последние 5 минут
       if (url.pathname === "/api/arcade/online" && request.method === "GET") {
-        const onlineRes = await db.execute(
-          "SELECT COUNT(DISTINCT token) as online FROM sessions WHERE last_seen > datetime('now', '-1 minutes')"
+        const result = await db.execute(
+          "SELECT COUNT(DISTINCT token) as online FROM sessions WHERE last_seen > datetime('now', '-5 minutes')"
         );
-        const totalRes = await db.execute(
-          "SELECT COUNT(*) as total FROM results WHERE is_suspicious = 0"
-        );
-        return Response.json({ 
-          online: Number(onlineRes.rows[0].online),
-          total: Number(totalRes.rows[0].total)
-        }, { headers: corsHeaders });
+        return Response.json({ online: Number(result.rows[0].online) }, { headers: corsHeaders });
       }
 
-      // 2. Таблица лидеров (с фильтром сложности и античитом)
+      // ─── /api/arcade/board ────────────────────────────────
+      // GET ?cat=typing&diff=medium — рейтинг по категории и сложности
+      // is_suspicious = 0 — читеры не попадают в рейтинг
       if (url.pathname === "/api/arcade/board" && request.method === "GET") {
         const cat = url.searchParams.get("cat");
-        const diff = url.searchParams.get("diff") || "all";
-        const validCats = ["typing", "clicking", "reaction", "memory"];
-        
-        if (!validCats.includes(cat)) {
+        const diff = url.searchParams.get("diff") || "medium";
+
+        if (!VALID_CATS.includes(cat)) {
           return Response.json({ error: "Неверная категория" }, { status: 400, headers: corsHeaders });
         }
-        
-        const order = cat === "reaction" ? "ASC" : "DESC";
-        
-        // Исключаем читеров (is_suspicious = 0)
-        let sql = "SELECT p.callsign, r.value, r.wpm, r.cpm, r.err_pct, r.diff, r.created_at " +
-                  "FROM results r JOIN players p ON r.player_id = p.id " +
-                  "WHERE r.cat = ? AND p.anon = 0 AND r.is_suspicious = 0";
-        
-        const args = [cat];
-
-        if (diff !== "all") {
-          sql += " AND r.diff = ?";
-          args.push(diff);
+        if (!VALID_DIFFS.includes(diff)) {
+          return Response.json({ error: "Неверная сложность" }, { status: 400, headers: corsHeaders });
         }
 
-        sql += " ORDER BY r.value " + order + " LIMIT 100";
-
-        const result = await db.execute({ sql: sql, args: args });
+        const order = cat === "reaction" ? "ASC" : "DESC";
+        const result = await db.execute({
+          sql: "SELECT p.callsign, r.value, r.wpm, r.cpm, r.err_pct, r.diff, r.created_at " +
+               "FROM results r JOIN players p ON r.player_id = p.id " +
+               "WHERE r.cat = ? AND r.diff = ? AND r.is_suspicious = 0 AND p.anon = 0 " +
+               "ORDER BY r.value " + order + " LIMIT 100",
+          args: [cat, diff]
+        });
         return Response.json(result.rows, { headers: corsHeaders });
       }
 
-      // 3. Средние значения (для графика)
+      // ─── /api/arcade/avgs ─────────────────────────────────
+      // GET ?diff=medium — средние топ-5 по каждой категории для указанной сложности
+      // is_suspicious = 0 — читеры не учитываются
       if (url.pathname === "/api/arcade/avgs" && request.method === "GET") {
-        const cat = url.searchParams.get("cat") || "typing";
-        const diff = url.searchParams.get("diff") || "all";
-        const order = cat === "reaction" ? "ASC" : "DESC";
-        
-        let sql = "SELECT AVG(value) as avg_val FROM (" +
-                  "SELECT value FROM results WHERE cat = ? AND is_suspicious = 0";
-        const args = [cat];
+        const diff = url.searchParams.get("diff") || "medium";
 
-        if (diff !== "all") {
-          sql += " AND diff = ?";
-          args.push(diff);
+        if (!VALID_DIFFS.includes(diff)) {
+          return Response.json({ error: "Неверная сложность" }, { status: 400, headers: corsHeaders });
         }
 
-        sql += " ORDER BY value " + order + " LIMIT 5)";
-
-        const result = await db.execute({ sql: sql, args: args });
-        return Response.json({ avg: result.rows[0].avg_val || 0 }, { headers: corsHeaders });
+        let avgs = {};
+        for (const cat of VALID_CATS) {
+          const order = cat === "reaction" ? "ASC" : "DESC";
+          const result = await db.execute({
+            sql: "SELECT AVG(value) as avg_val FROM (" +
+                 "SELECT value FROM results WHERE cat = ? AND diff = ? AND is_suspicious = 0 " +
+                 "ORDER BY value " + order + " LIMIT 5)",
+            args: [cat, diff]
+          });
+          avgs[cat] = result.rows[0].avg_val || 0;
+        }
+        return Response.json(avgs, { headers: corsHeaders });
       }
 
-      // 4. Сохранение результата (с сложностью и античитом)
+      // ─── /api/arcade/result ───────────────────────────────
+      // POST { callsign, cat, diff, value, wpm, cpm, err_pct, is_suspicious, proof }
+      // Сохраняет результат (включая читерские — для логов), но на борд не выводит
       if (url.pathname === "/api/arcade/result" && request.method === "POST") {
         const body = await request.json();
-        const { callsign, cat, value, wpm, cpm, err_pct, difficulty, is_suspicious } = body;
-        
+        const { callsign, cat, diff, value, wpm, cpm, err_pct, is_suspicious, proof } = body;
+
         if (!callsign || !cat || value === undefined) {
-          return Response.json({ error: "Отсутствуют обязательные поля" }, { status: 400, headers: corsHeaders });
+          return Response.json({ error: "Отсутствуют обязательные поля (callsign, cat, value)" }, { status: 400, headers: corsHeaders });
         }
 
-        // Проверяем игрока
+        const finalDiff = VALID_DIFFS.includes(diff) ? diff : "medium";
+        const finalSuspicious = is_suspicious ? 1 : 0;
+
+        // Найти или создать игрока
         let pRes = await db.execute({
           sql: "SELECT id FROM players WHERE callsign = ?",
           args: [callsign]
         });
-        
         let playerId;
         if (pRes.rows.length === 0) {
           const insertP = await db.execute({
@@ -222,24 +223,17 @@ export default {
           });
         }
 
-        // Записываем результат с учетом новых полей
+        // Сохранить результат с новыми полями
         await db.execute({
-          sql: "INSERT INTO results (player_id, cat, value, wpm, cpm, err_pct, diff, is_suspicious) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-          args: [
-            playerId, 
-            cat, 
-            value, 
-            wpm || null, 
-            cpm || null, 
-            err_pct || null, 
-            difficulty || 'medium', 
-            is_suspicious ? 1 : 0
-          ]
+          sql: "INSERT INTO results (player_id, cat, diff, value, wpm, cpm, err_pct, is_suspicious, proof) " +
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          args: [playerId, cat, finalDiff, value, wpm || null, cpm || null, err_pct || null, finalSuspicious, proof || null]
         });
         return Response.json({ ok: true }, { headers: corsHeaders });
       }
 
-      // 5. Хартбит (онлайн)
+      // ─── /api/arcade/heartbeat ────────────────────────────
+      // POST { token, player_id } — обновить last_seen для онлайна
       if (url.pathname === "/api/arcade/heartbeat" && request.method === "POST") {
         const body = await request.json();
         const { token, player_id } = body;
@@ -251,19 +245,6 @@ export default {
                "ON CONFLICT(token) DO UPDATE SET last_seen = CURRENT_TIMESTAMP, player_id = COALESCE(?, player_id)",
           args: [token, player_id || null, player_id || null]
         });
-        return Response.json({ ok: true }, { headers: corsHeaders });
-      }
-
-      // 6. Пользователь ушел (закрыл вкладку)
-      if (url.pathname === "/api/arcade/leave" && request.method === "POST") {
-        const body = await request.json();
-        const { token } = body;
-        if (token) {
-          await db.execute({
-            sql: "DELETE FROM sessions WHERE token = ?",
-            args: [token]
-          });
-        }
         return Response.json({ ok: true }, { headers: corsHeaders });
       }
 
